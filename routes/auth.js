@@ -1,0 +1,373 @@
+import express from "express";
+import User from "../models/User.model.js";
+import {
+  generateRegistrationOptions,
+  verifyRegistrationResponse,
+  generateAuthenticationOptions,
+  verifyAuthenticationResponse,
+} from '@simplewebauthn/server';
+import crypto from 'crypto';
+
+const router = express.Router();
+
+// Dynamic configuration based on environment
+const rpName = 'Biometric Auth App';
+const isDevelopment = process.env.NODE_ENV !== 'production';
+
+// Helper function to get current domain configuration
+const getDomainConfig = (req) => {
+  const origin = req.headers.origin || req.headers.referer;
+  
+  if (origin && origin.includes('biometricauth-frontend.vercel.app')) {
+    return {
+      rpID: 'biometricauth-frontend.vercel.app',
+      expectedOrigin: 'https://biometricauth-frontend.vercel.app'
+    };
+  } else {
+    return {
+      rpID: 'localhost',
+      expectedOrigin: 'http://localhost:5173'
+    };
+  }
+};
+
+// ========== TRADITIONAL AUTHENTICATION ==========
+
+// Traditional Signup
+router.post("/signup", async (req, res) => {
+  try {
+    const { firstname, lastname, username, password } = req.body;
+
+    // Check if user already exists
+    const existingUser = await User.findOne({ username });
+    if (existingUser) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Username already exists" 
+      });
+    }
+
+    // Generate unique userId for WebAuthn
+    const userId = crypto.randomUUID();
+
+    // Create new user
+    const newUser = new User({
+      firstname,
+      lastname,
+      username,
+      userId,
+      password, // In production, hash this password
+      credentials: [],
+      currentChallenge: null
+    });
+
+    await newUser.save();
+
+    res.status(201).json({
+      success: true,
+      message: "User created successfully",
+      user: {
+        id: newUser._id,
+        username: newUser.username,
+        firstname: newUser.firstname,
+        lastname: newUser.lastname,
+        userId: newUser.userId
+      }
+    });
+
+  } catch (error) {
+    console.error("Signup error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Internal server error" 
+    });
+  }
+});
+
+// Traditional Login
+router.post("/login", async (req, res) => {
+  try {
+    const { username, password } = req.body;
+
+    // Find user
+    const user = await User.findOne({ username });
+    if (!user) {
+      return res.status(401).json({ 
+        success: false, 
+        message: "Invalid credentials" 
+      });
+    }
+
+    // Check password (in production, compare hashed passwords)
+    if (user.password !== password) {
+      return res.status(401).json({ 
+        success: false, 
+        message: "Invalid credentials" 
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Login successful",
+      user: {
+        id: user._id,
+        username: user.username,
+        firstname: user.firstname,
+        lastname: user.lastname,
+        userId: user.userId,
+        hasPasskeys: user.credentials.length > 0
+      }
+    });
+
+  } catch (error) {
+    console.error("Login error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Internal server error" 
+    });
+  }
+});
+
+// ========== WEBAUTHN/BIOMETRIC AUTHENTICATION ==========
+
+// Step 1: Generate registration options for biometric setup
+router.post("/webauthn/register/begin", async (req, res) => {
+  try {
+    const { username } = req.body;
+    const { rpID } = getDomainConfig(req);
+
+    const user = await User.findOne({ username });
+    if (!user) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "User not found" 
+      });
+    }
+
+    const options = await generateRegistrationOptions({
+      rpName,
+      rpID,
+      userID: user.userId,
+      userName: user.username,
+      userDisplayName: `${user.firstname} ${user.lastname}`,
+      attestationType: 'none',
+      excludeCredentials: user.credentials.map(cred => ({
+        id: cred.credentialID,
+        type: 'public-key',
+      })),
+      authenticatorSelection: {
+        residentKey: 'preferred',
+        userVerification: 'preferred',
+        authenticatorAttachment: 'platform', // For built-in biometrics
+      },
+    });
+
+    user.currentChallenge = options.challenge;
+    await user.save();
+
+    res.json({
+      success: true,
+      options
+    });
+
+  } catch (error) {
+    console.error("WebAuthn registration begin error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Failed to generate registration options" 
+    });
+  }
+});
+
+router.post("/webauthn/register/finish", async (req, res) => {
+  try {
+    const { username, credential } = req.body;
+    const { rpID, expectedOrigin } = getDomainConfig(req);
+
+    const user = await User.findOne({ username });
+    if (!user || !user.currentChallenge) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Invalid registration attempt" 
+      });
+    }
+
+    const verification = await verifyRegistrationResponse({
+      response: credential,
+      expectedChallenge: user.currentChallenge,
+      expectedOrigin,
+      expectedRPID: rpID,
+    });
+
+    if (verification.verified) {
+      user.credentials.push({
+        credentialID: verification.registrationInfo.credentialID,
+        credentialPublicKey: verification.registrationInfo.credentialPublicKey,
+        counter: verification.registrationInfo.counter,
+        createdAt: new Date()
+      });
+
+      user.currentChallenge = null;
+      await user.save();
+
+      res.json({
+        success: true,
+        message: "Biometric authentication setup successful!"
+      });
+    } else {
+      res.status(400).json({ 
+        success: false, 
+        message: "Registration verification failed" 
+      });
+    }
+
+  } catch (error) {
+    console.error("WebAuthn registration finish error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Registration verification failed" 
+    });
+  }
+});
+
+router.post("/webauthn/authenticate/begin", async (req, res) => {
+  try {
+    const { username } = req.body;
+    const { rpID } = getDomainConfig(req);
+
+    const user = await User.findOne({ username });
+    if (!user || user.credentials.length === 0) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "No biometric credentials found for this user" 
+      });
+    }
+
+    const options = await generateAuthenticationOptions({
+      rpID,
+      allowCredentials: user.credentials.map(cred => ({
+        id: cred.credentialID,
+        type: 'public-key',
+      })),
+      userVerification: 'preferred',
+    });
+
+    user.currentChallenge = options.challenge;
+    await user.save();
+
+    res.json({
+      success: true,
+      options
+    });
+
+  } catch (error) {
+    console.error("WebAuthn authentication begin error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Failed to generate authentication options" 
+    });
+  }
+});
+
+router.post("/webauthn/authenticate/finish", async (req, res) => {
+  try {
+    const { username, credential } = req.body;
+    const { rpID, expectedOrigin } = getDomainConfig(req);
+
+    const user = await User.findOne({ username });
+    if (!user || !user.currentChallenge) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Invalid authentication attempt" 
+      });
+    }
+
+    const userCredential = user.credentials.find(cred => 
+      cred.credentialID.equals(credential.id)
+    );
+
+    if (!userCredential) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Credential not found" 
+      });
+    }
+
+    const verification = await verifyAuthenticationResponse({
+      response: credential,
+      expectedChallenge: user.currentChallenge,
+      expectedOrigin,
+      expectedRPID: rpID,
+      authenticator: {
+        credentialID: userCredential.credentialID,
+        credentialPublicKey: userCredential.credentialPublicKey,
+        counter: userCredential.counter,
+      },
+    });
+
+    if (verification.verified) {
+      userCredential.counter = verification.authenticationInfo.newCounter;
+      user.currentChallenge = null;
+      await user.save();
+
+      res.json({
+        success: true,
+        message: "Biometric authentication successful!",
+        user: {
+          id: user._id,
+          username: user.username,
+          firstname: user.firstname,
+          lastname: user.lastname
+        }
+      });
+    } else {
+      res.status(400).json({ 
+        success: false, 
+        message: "Authentication verification failed" 
+      });
+    }
+
+  } catch (error) {
+    console.error("WebAuthn authentication finish error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Authentication verification failed" 
+    });
+  }
+});
+
+// Get user info (check if user has biometric setup)
+router.get("/user/:username", async (req, res) => {
+  try {
+    const { username } = req.params;
+    
+    const user = await User.findOne({ username }).select('-password -currentChallenge');
+    if (!user) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "User not found" 
+      });
+    }
+
+    res.json({
+      success: true,
+      user: {
+        id: user._id,
+        username: user.username,
+        firstname: user.firstname,
+        lastname: user.lastname,
+        hasPasskeys: user.credentials.length > 0,
+        credentialCount: user.credentials.length
+      }
+    });
+
+  } catch (error) {
+    console.error("Get user error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Internal server error" 
+    });
+  }
+});
+
+export default router;
