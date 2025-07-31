@@ -1,8 +1,10 @@
+// Import crypto polyfill FIRST before any other imports
+import './crypto-polyfill.js';
+
 import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
 import { connectMongo } from "./utils/db.js";
-
 
 import authRoutes from "./routes/auth.js";
 
@@ -23,15 +25,10 @@ app.use(cors({
   credentials: true 
 }));
 
-
-
 // Test route
 app.get("/", (req, res) => {
   res.send("Biometric authentication API is running...");
 });
-
-
-
 
 app.use("/auth", authRoutes);
 
@@ -39,5 +36,6 @@ app.use("/auth", authRoutes);
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`Node.js version: ${process.version}`);
+  console.log(`Crypto available: ${!!globalThis.crypto}`);
 });
-
