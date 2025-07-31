@@ -143,23 +143,25 @@ router.post("/webauthn/register/begin", async (req, res) => {
         message: "User not found" 
       });
     }
-const options = await generateRegistrationOptions({
-  rpName,
-  rpID,
-  userID: Buffer.from(user.userId, 'utf8'), // <-- convert to Buffer
-  userName: user.username,
-  userDisplayName: `${user.firstname} ${user.lastname}`,
-  attestationType: 'none',
-  excludeCredentials: user.credentials.map(cred => ({
-    id: cred.credentialID,
-    type: 'public-key',
-  })),
-  authenticatorSelection: {
-    residentKey: 'preferred',
-    userVerification: 'preferred',
-    authenticatorAttachment: 'platform',
-  },
-});
+
+    const options = await generateRegistrationOptions({
+      rpName,
+      rpID,
+      userID: Buffer.from(user.userId, 'utf8'),
+      userName: user.username,
+      userDisplayName: `${user.firstname} ${user.lastname}`,
+      attestationType: 'none',
+      excludeCredentials: user.credentials.map(cred => ({
+        id: cred.credentialID,
+        type: 'public-key',
+      })),
+      authenticatorSelection: {
+        residentKey: 'preferred',
+        userVerification: 'preferred',
+        // Remove authenticatorAttachment to allow all types
+      },
+      timeout: 60000,
+    });
 
     user.currentChallenge = options.challenge;
     await user.save();
@@ -191,7 +193,6 @@ router.post("/webauthn/register/finish", async (req, res) => {
       });
     }
 
-    
     const verification = await verifyRegistrationResponse({
       response: credential,
       expectedChallenge: user.currentChallenge,
@@ -199,34 +200,55 @@ router.post("/webauthn/register/finish", async (req, res) => {
       expectedRPID: rpID,
     });
 
-   
-  if (verification.verified) {
-  const cred = verification.registrationInfo.credential;
-   // Add these logs here:
-  console.log('Registration credential:', cred);
-  console.log('cred.id:', cred.id, typeof cred.id);
-  console.log('cred.publicKey:', cred.publicKey, typeof cred.publicKey);
+    if (verification.verified) {
+      const registrationInfo = verification.registrationInfo;
+      
+      console.log('Registration info:', registrationInfo);
+      console.log('credentialID:', registrationInfo.credentialID, typeof registrationInfo.credentialID);
+      console.log('credentialPublicKey:', registrationInfo.credentialPublicKey, typeof registrationInfo.credentialPublicKey);
 
-  user.credentials.push({
-    credentialID: Buffer.from(cred.id, 'base64url'), // convert from base64url string to Buffer
-    credentialPublicKey: Buffer.from(cred.publicKey), // already Uint8Array, Buffer.from works
-    counter: cred.counter,
-    createdAt: new Date()
-  });
+      // FIXED: Handle both string and Uint8Array cases properly
+      let credentialID, credentialPublicKey;
 
-  user.currentChallenge = null;
-  await user.save();
+      if (typeof registrationInfo.credentialID === 'string') {
+        // If it's already a string (base64url), convert to Buffer
+        credentialID = Buffer.from(registrationInfo.credentialID, 'base64url');
+      } else {
+        // If it's Uint8Array, convert directly to Buffer
+        credentialID = Buffer.from(registrationInfo.credentialID);
+      }
 
-  res.json({
-    success: true,
-    message: "Biometric authentication setup successful!"
-  });
-} else {
-  res.status(400).json({ 
-    success: false, 
-    message: "Registration verification failed" 
-  });
-}
+      if (registrationInfo.credentialPublicKey instanceof Uint8Array) {
+        credentialPublicKey = Buffer.from(registrationInfo.credentialPublicKey);
+      } else {
+        credentialPublicKey = Buffer.from(registrationInfo.credentialPublicKey);
+      }
+      
+      console.log('Storing credentialID as base64url:', credentialID.toString('base64url'));
+      console.log('Original credential from frontend:', credential.rawId || credential.id);
+
+      user.credentials.push({
+        credentialID: credentialID,
+        credentialPublicKey: credentialPublicKey,
+        counter: registrationInfo.counter,
+        createdAt: new Date()
+      });
+
+      user.currentChallenge = null;
+      await user.save();
+
+      console.log('Successfully stored credential with ID:', credentialID.toString('base64url'));
+
+      res.json({
+        success: true,
+        message: "Biometric authentication setup successful!"
+      });
+    } else {
+      res.status(400).json({ 
+        success: false, 
+        message: "Registration verification failed" 
+      });
+    }
 
   } catch (error) {
     console.error("WebAuthn registration finish error:", error);
@@ -236,7 +258,6 @@ router.post("/webauthn/register/finish", async (req, res) => {
     });
   }
 });
-
 router.post("/webauthn/authenticate/begin", async (req, res) => {
   try {
     const { username } = req.body;
@@ -250,13 +271,24 @@ router.post("/webauthn/authenticate/begin", async (req, res) => {
       });
     }
 
+    // Add debugging
+    console.log('User credentials in DB:', user.credentials.map(c => ({
+      id: c.credentialID.toString('base64url'),
+      createdAt: c.createdAt
+    })));
+
+    const allowCredentials = user.credentials.map(cred => ({
+      id: cred.credentialID.toString('base64url'),
+      type: 'public-key',
+    }));
+
+    console.log('Sending allowCredentials:', allowCredentials);
+
     const options = await generateAuthenticationOptions({
       rpID,
-      allowCredentials: user.credentials.map(cred => ({
-    id: cred.credentialID.toString('base64url'), // <-- convert Buffer to base64url string
-    type: 'public-key',
-  })),
+      allowCredentials,
       userVerification: 'preferred',
+      timeout: 60000,
     });
 
     user.currentChallenge = options.challenge;
@@ -295,6 +327,10 @@ router.post("/webauthn/authenticate/finish", async (req, res) => {
     console.log('Credential received:', JSON.stringify(credential, null, 2));
     console.log('credential.rawId from frontend:', credential.rawId);
     console.log('credentialID in DB:', user.credentials.map(c => c.credentialID.toString('base64url')));
+    
+    // Debug: Also log raw buffer comparison
+    console.log('Frontend credential buffer:', credentialIdBuffer.toString('base64url'));
+    console.log('DB credential buffers:', user.credentials.map(c => c.credentialID.toString('base64url')));
 
     const userCredential = user.credentials.find(cred => 
       cred.credentialID.equals(credentialIdBuffer)
@@ -302,15 +338,16 @@ router.post("/webauthn/authenticate/finish", async (req, res) => {
 
     if (!userCredential) {
       console.error('Credential not found for user:', username);
+      console.error('Available credentials count:', user.credentials.length);
       return res.status(400).json({ 
         success: false, 
-        message: "Credential not found" 
+        message: "Credential not found. Please re-register your biometric authentication." 
       });
     }
 
+    // Rest of your authentication logic...
     console.log('userCredential found:', userCredential);
 
-    // Use v10.x API structure with authenticator object
     const verification = await verifyAuthenticationResponse({
       response: credential,
       expectedChallenge: user.currentChallenge,
@@ -326,7 +363,6 @@ router.post("/webauthn/authenticate/finish", async (req, res) => {
     console.log('Verification result:', verification);
 
     if (verification.verified) {
-      // Update counter with new value
       userCredential.counter = verification.authenticationInfo.newCounter;
       user.currentChallenge = null;
       await user.save();
@@ -387,6 +423,37 @@ router.get("/user/:username", async (req, res) => {
     res.status(500).json({ 
       success: false, 
       message: "Internal server error" 
+    });
+  }
+});
+// Add this temporarily for cleanup
+router.delete("/webauthn/clear/:username", async (req, res) => {
+  try {
+    const { username } = req.params;
+    
+    const user = await User.findOne({ username });
+    if (!user) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "User not found" 
+      });
+    }
+
+    // Clear all credentials and challenges
+    user.credentials = [];
+    user.currentChallenge = null;
+    await user.save();
+
+    res.json({
+      success: true,
+      message: "All biometric credentials cleared"
+    });
+
+  } catch (error) {
+    console.error("Clear credentials error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Failed to clear credentials" 
     });
   }
 });
