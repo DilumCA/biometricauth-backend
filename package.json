@@ -9,11 +9,15 @@
     "dev": "nodemon index.js",
     "start": "node index.js"
   },
-  "keywords": ["biometric", "webauthn", "authentication"],
+  "keywords": [
+    "biometric",
+    "webauthn",
+    "authentication"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@simplewebauthn/server": "^13.1.2",
+    "@simplewebauthn/server": "^10.0.1",
     "cloudinary": "^1.41.3",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",

@@ -289,65 +289,44 @@ router.post("/webauthn/authenticate/finish", async (req, res) => {
       });
     }
 
-    // Log credential received
+    // Use rawId instead of id for credential matching
+    const credentialIdBuffer = Buffer.from(credential.rawId, 'base64url');
+    
     console.log('Credential received:', JSON.stringify(credential, null, 2));
-console.log('credential.id from frontend:', credential.id);
-console.log('credentialID in DB:', user.credentials.map(c => c.credentialID.toString('base64url')));
+    console.log('credential.rawId from frontend:', credential.rawId);
+    console.log('credentialID in DB:', user.credentials.map(c => c.credentialID.toString('base64url')));
 
-  const userCredential = user.credentials.find(cred => 
-  cred.credentialID.equals(Buffer.from(credential.id, 'base64url'))
-);
+    const userCredential = user.credentials.find(cred => 
+      cred.credentialID.equals(credentialIdBuffer)
+    );
 
-if (!userCredential) {
-  console.error('Credential not found for user:', username);
-  return res.status(400).json({ 
-    success: false, 
-    message: "Credential not found" 
-  });
-}
-// Add these logs and the check here:
-console.log('userCredential:', userCredential);
-console.log('userCredential.counter:', userCredential.counter, typeof userCredential.counter);
+    if (!userCredential) {
+      console.error('Credential not found for user:', username);
+      return res.status(400).json({ 
+        success: false, 
+        message: "Credential not found" 
+      });
+    }
 
-const counter = userCredential.counter;
-if (typeof counter !== 'number') {
-  console.error('Credential counter is not a number:', counter);
-  return res.status(500).json({ success: false, message: "Credential counter invalid" });
-}
+    console.log('userCredential found:', userCredential);
 
-const credentialID = Buffer.from(userCredential.credentialID.valueOf());
-const credentialPublicKey = Buffer.from(userCredential.credentialPublicKey.valueOf());
+    // Use v10.x API structure with authenticator object
+    const verification = await verifyAuthenticationResponse({
+      response: credential,
+      expectedChallenge: user.currentChallenge,
+      expectedOrigin,
+      expectedRPID: rpID,
+      authenticator: {
+        credentialID: userCredential.credentialID,
+        credentialPublicKey: userCredential.credentialPublicKey,
+        counter: userCredential.counter,
+      },
+    });
 
-
-console.log('Authenticator for verification:', {
-  credentialID,
-  credentialPublicKey,
-  counter,
-  types: {
-    credentialID: credentialID.constructor.name,
-    credentialPublicKey: credentialPublicKey.constructor.name,
-    counter: typeof counter,
-  }
-});
-
-const verification = await verifyAuthenticationResponse({
-  response: credential,
-  expectedChallenge: user.currentChallenge,
-  expectedOrigin,
-  expectedRPID: rpID,
-  authenticator: {
-    credentialID,
-    credentialPublicKey,
-    counter,
-    credentialDeviceType: 'singleDevice', // or 'multiDevice'
-    credentialBackedUp: false             // or true, if known
-  },
-});
-
-    // Log verification result
     console.log('Verification result:', verification);
 
     if (verification.verified) {
+      // Update counter with new value
       userCredential.counter = verification.authenticationInfo.newCounter;
       user.currentChallenge = null;
       await user.save();
