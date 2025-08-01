@@ -7,6 +7,7 @@ import {
   verifyAuthenticationResponse,
 } from '@simplewebauthn/server';
 import crypto from 'crypto';
+import bcrypt from 'bcrypt'; 
 
 const router = express.Router();
 
@@ -30,7 +31,57 @@ const getDomainConfig = (req) => {
     };
   }
 };
-
+// Helper function to detect device info
+const getDeviceInfo = () => {
+  const userAgent = navigator.userAgent;
+  let deviceName = 'Unknown Device';
+  let deviceType = 'unknown';
+  
+  // Detect operating system
+  if (/iPhone|iPad|iPod/i.test(userAgent)) {
+    const match = userAgent.match(/iPhone OS (\d+_\d+)/);
+    const version = match ? match[1].replace('_', '.') : '';
+    deviceName = /iPad/i.test(userAgent) ? `iPad ${version}` : `iPhone ${version}`;
+    deviceType = 'mobile';
+  } else if (/Android/i.test(userAgent)) {
+    const match = userAgent.match(/Android (\d+\.?\d*)/);
+    const version = match ? match[1] : '';
+    deviceName = `Android ${version}`;
+    deviceType = 'mobile';
+  } else if (/Windows NT/i.test(userAgent)) {
+    const match = userAgent.match(/Windows NT (\d+\.?\d*)/);
+    const version = match ? match[1] : '';
+    deviceName = `Windows ${version}`;
+    deviceType = 'desktop';
+  } else if (/Mac OS X/i.test(userAgent)) {
+    const match = userAgent.match(/Mac OS X (\d+_\d+)/);
+    const version = match ? match[1].replace('_', '.') : '';
+    deviceName = `macOS ${version}`;
+    deviceType = 'desktop';
+  } else if (/Linux/i.test(userAgent)) {
+    deviceName = 'Linux';
+    deviceType = 'desktop';
+  }
+  
+  // Add browser info
+  let browser = 'Unknown Browser';
+  if (/Chrome/i.test(userAgent) && !/Edge/i.test(userAgent)) {
+    browser = 'Chrome';
+  } else if (/Firefox/i.test(userAgent)) {
+    browser = 'Firefox';
+  } else if (/Safari/i.test(userAgent) && !/Chrome/i.test(userAgent)) {
+    browser = 'Safari';
+  } else if (/Edge/i.test(userAgent)) {
+    browser = 'Edge';
+  }
+  
+  return {
+    name: `${deviceName} (${browser})`,
+    type: deviceType,
+    browser: browser,
+    userAgent: userAgent
+  };
+};
 // ========== TRADITIONAL AUTHENTICATION ==========
 
 // Traditional Signup
@@ -50,13 +101,17 @@ router.post("/signup", async (req, res) => {
     // Generate unique userId for WebAuthn
     const userId = crypto.randomUUID();
 
+    // Hash the password before storing
+    const saltRounds = 12; // Recommended: 10-12 rounds
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
+
     // Create new user
     const newUser = new User({
       firstname,
       lastname,
       username,
       userId,
-      password, // In production, hash this password
+      password: hashedPassword, // ← Store hashed password
       credentials: [],
       currentChallenge: null
     });
@@ -98,8 +153,9 @@ router.post("/login", async (req, res) => {
       });
     }
 
-    // Check password (in production, compare hashed passwords)
-    if (user.password !== password) {
+    // Compare password with hashed password
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+    if (!isPasswordValid) {
       return res.status(401).json({ 
         success: false, 
         message: "Invalid credentials" 
@@ -127,7 +183,6 @@ router.post("/login", async (req, res) => {
     });
   }
 });
-
 // ========== WEBAUTHN/BIOMETRIC AUTHENTICATION ==========
 
 // Step 1: Generate registration options for biometric setup
@@ -152,7 +207,7 @@ router.post("/webauthn/register/begin", async (req, res) => {
       userDisplayName: `${user.firstname} ${user.lastname}`,
       attestationType: 'none',
       excludeCredentials: user.credentials.map(cred => ({
-        id: cred.credentialID,
+        id: cred.credentialID.toString('base64url'),
         type: 'public-key',
       })),
       authenticatorSelection: {
@@ -182,7 +237,7 @@ router.post("/webauthn/register/begin", async (req, res) => {
 
 router.post("/webauthn/register/finish", async (req, res) => {
   try {
-    const { username, credential } = req.body;
+    const { username, credential, deviceInfo } = req.body; // deviceInfo from frontend
     const { rpID, expectedOrigin } = getDomainConfig(req);
 
     const user = await User.findOne({ username });
@@ -203,18 +258,12 @@ router.post("/webauthn/register/finish", async (req, res) => {
     if (verification.verified) {
       const registrationInfo = verification.registrationInfo;
       
-      console.log('Registration info:', registrationInfo);
-      console.log('credentialID:', registrationInfo.credentialID, typeof registrationInfo.credentialID);
-      console.log('credentialPublicKey:', registrationInfo.credentialPublicKey, typeof registrationInfo.credentialPublicKey);
-
-      // FIXED: Handle both string and Uint8Array cases properly
+      // Handle credential ID conversion
       let credentialID, credentialPublicKey;
 
       if (typeof registrationInfo.credentialID === 'string') {
-        // If it's already a string (base64url), convert to Buffer
         credentialID = Buffer.from(registrationInfo.credentialID, 'base64url');
       } else {
-        // If it's Uint8Array, convert directly to Buffer
         credentialID = Buffer.from(registrationInfo.credentialID);
       }
 
@@ -223,25 +272,85 @@ router.post("/webauthn/register/finish", async (req, res) => {
       } else {
         credentialPublicKey = Buffer.from(registrationInfo.credentialPublicKey);
       }
-      
-      console.log('Storing credentialID as base64url:', credentialID.toString('base64url'));
-      console.log('Original credential from frontend:', credential.rawId || credential.id);
 
-      user.credentials.push({
+      // Check if this credential already exists
+      const existingCredential = user.credentials.find(cred => 
+        cred.credentialID.equals(credentialID)
+      );
+
+      if (existingCredential) {
+        return res.status(400).json({ 
+          success: false, 
+          message: "This device is already registered" 
+        });
+      }
+
+      // Auto-generate device name with fallback options
+      let deviceName = 'Unknown Device';
+      let detectedType = 'unknown';
+      
+      if (deviceInfo) {
+        deviceName = deviceInfo.name || deviceInfo.deviceName;
+        detectedType = deviceInfo.type || 'unknown';
+      }
+      
+      // Fallback: Use authenticator attachment info
+      if (!deviceInfo && credential.authenticatorAttachment) {
+        if (credential.authenticatorAttachment === 'platform') {
+          deviceName = 'Built-in Authenticator';
+          detectedType = 'platform';
+        } else if (credential.authenticatorAttachment === 'cross-platform') {
+          deviceName = 'External Authenticator';
+          detectedType = 'cross-platform';
+        }
+      }
+      
+      // Add device count suffix to avoid duplicates
+      const deviceNumber = user.credentials.length + 1;
+      if (deviceName === 'Unknown Device') {
+        deviceName = `Device ${deviceNumber}`;
+      }
+
+      // Check for duplicate names and add suffix
+      const existingNames = user.credentials.map(c => c.deviceName);
+      let finalDeviceName = deviceName;
+      let suffix = 1;
+      while (existingNames.includes(finalDeviceName)) {
+        finalDeviceName = `${deviceName} (${suffix})`;
+        suffix++;
+      }
+
+      const newCredential = {
         credentialID: credentialID,
         credentialPublicKey: credentialPublicKey,
         counter: registrationInfo.counter,
-        createdAt: new Date()
-      });
+        deviceName: finalDeviceName,
+        deviceType: detectedType,
+        authenticatorType: credential.authenticatorAttachment || 'unknown',
+        createdAt: new Date(),
+        lastUsed: null,
+        // Store additional device info if provided
+        ...(deviceInfo && {
+          browser: deviceInfo.browser,
+          userAgent: deviceInfo.userAgent
+        })
+      };
 
+      user.credentials.push(newCredential);
       user.currentChallenge = null;
       await user.save();
 
-      console.log('Successfully stored credential with ID:', credentialID.toString('base64url'));
+      console.log(`Successfully registered device "${finalDeviceName}" for user ${username}`);
 
       res.json({
         success: true,
-        message: "Biometric authentication setup successful!"
+        message: "Biometric authentication setup successful!",
+        device: {
+          name: newCredential.deviceName,
+          type: newCredential.deviceType,
+          authenticatorType: newCredential.authenticatorType,
+          credentialId: credentialID.toString('base64url')
+        }
       });
     } else {
       res.status(400).json({ 
@@ -426,10 +535,53 @@ router.get("/user/:username", async (req, res) => {
     });
   }
 });
-// Add this temporarily for cleanup
-router.delete("/webauthn/clear/:username", async (req, res) => {
+// Get user's registered devices with detailed info
+// Get user's registered devices with detailed info
+router.get("/user/:username/devices", async (req, res) => {
   try {
     const { username } = req.params;
+    
+    const user = await User.findOne({ username }).select('credentials');
+    if (!user) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "User not found" 
+      });
+    }
+
+    const devices = user.credentials.map(cred => ({
+      id: cred.credentialID.toString('base64url'),
+      name: cred.deviceName || 'Unknown Device',
+      type: cred.deviceType || 'unknown',
+      authenticatorType: cred.authenticatorType || 'unknown',
+      browser: cred.browser,
+      createdAt: cred.createdAt,
+      lastUsed: cred.lastUsed,
+      // Don't send full userAgent for privacy
+      hasUserAgent: !!cred.userAgent
+    }));
+
+    res.json({
+      success: true,
+      devices,
+      count: devices.length
+    });
+
+  } catch (error) {
+    console.error("Get devices error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Internal server error" 
+    });
+  }
+});
+
+// Remove a specific device
+router.delete("/webauthn/device/:username/:credentialId", async (req, res) => {
+  try {
+    const { username, credentialId } = req.params;
+    
+    console.log(`Attempting to delete device for user: ${username}, credentialId: ${credentialId}`);
     
     const user = await User.findOne({ username });
     if (!user) {
@@ -439,21 +591,43 @@ router.delete("/webauthn/clear/:username", async (req, res) => {
       });
     }
 
-    // Clear all credentials and challenges
-    user.credentials = [];
-    user.currentChallenge = null;
+    // Convert base64url string to Buffer for comparison
+    const credentialBuffer = Buffer.from(credentialId, 'base64url');
+    const credentialIndex = user.credentials.findIndex(cred => 
+      cred.credentialID.equals(credentialBuffer)
+    );
+
+    if (credentialIndex === -1) {
+      console.log(`Device not found. Available devices:`, user.credentials.map(c => ({
+        id: c.credentialID.toString('base64url'),
+        name: c.deviceName
+      })));
+      return res.status(404).json({ 
+        success: false, 
+        message: "Device not found" 
+      });
+    }
+
+    const removedDevice = user.credentials[credentialIndex];
+    user.credentials.splice(credentialIndex, 1);
     await user.save();
+
+    console.log(`Successfully removed device: ${removedDevice.deviceName}`);
 
     res.json({
       success: true,
-      message: "All biometric credentials cleared"
+      message: "Device removed successfully",
+      removedDevice: {
+        name: removedDevice.deviceName,
+        type: removedDevice.deviceType
+      }
     });
 
   } catch (error) {
-    console.error("Clear credentials error:", error);
+    console.error("Remove device error:", error);
     res.status(500).json({ 
       success: false, 
-      message: "Failed to clear credentials" 
+      message: "Failed to remove device" 
     });
   }
 });
