@@ -20,9 +20,10 @@ app.use(cors({
   origin: [
     "http://localhost:5173", 
     "http://192.168.1.6:5173",
-    "https://biometricauth-frontend.vercel.app" 
-  ], 
-  credentials: true 
+    "https://biometricauth-frontend.vercel.app",
+    "https://biometricauth-frontend-git-dev-dilumcas-projects.vercel.app"
+  ],
+  credentials: true
 }));
 
 // Test route
