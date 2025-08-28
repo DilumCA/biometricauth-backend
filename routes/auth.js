@@ -535,7 +535,7 @@ router.get("/user/:username", async (req, res) => {
     });
   }
 });
-// Get user's registered devices with detailed info
+
 // Get user's registered devices with detailed info
 router.get("/user/:username/devices", async (req, res) => {
   try {
