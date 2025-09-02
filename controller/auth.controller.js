@@ -16,12 +16,17 @@ const rpName = 'Biometric Auth App';
 
 // Helper function to get current domain configuration
 export const getDomainConfig = (req) => {
-  const origin = req.headers.origin || req.headers.referer;
+  const origin = req.headers.origin || req.headers.referer || '';
   
-  if (origin && origin.includes('biometricauth-frontend.vercel.app')) {
+  if (origin.includes('biometricauth-frontend.vercel.app')) {
     return {
       rpID: 'biometricauth-frontend.vercel.app',
       expectedOrigin: 'https://biometricauth-frontend.vercel.app'
+    };
+  } else if (origin.includes('railway.app')) {
+    return {
+      rpID: 'biometricauth-backend-production.up.railway.app',
+      expectedOrigin: 'https://biometricauth-backend-production.up.railway.app'
     };
   } else {
     return {
