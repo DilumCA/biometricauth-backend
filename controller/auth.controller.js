@@ -1,4 +1,3 @@
-import express from "express";
 import User from "../models/User.model.js";
 import {
   generateRegistrationOptions,
@@ -7,16 +6,16 @@ import {
   verifyAuthenticationResponse,
 } from '@simplewebauthn/server';
 import crypto from 'crypto';
-import bcrypt from 'bcrypt'; 
+import bcrypt from 'bcrypt';
+import { sendSuspiciousLoginAlert } from '../utils/emailService.js';
+import { getLocationFromIP } from '../utils/ipService.js';
+import { isTravelPlausible } from '../utils/securityUtils.js';
 
-const router = express.Router();
-
-// Dynamic configuration based on environment
+// Constants
 const rpName = 'Biometric Auth App';
-const isDevelopment = process.env.NODE_ENV !== 'production';
 
 // Helper function to get current domain configuration
-const getDomainConfig = (req) => {
+export const getDomainConfig = (req) => {
   const origin = req.headers.origin || req.headers.referer;
   
   if (origin && origin.includes('biometricauth-frontend.vercel.app')) {
@@ -31,8 +30,9 @@ const getDomainConfig = (req) => {
     };
   }
 };
+
 // Helper function to detect device info
-const getDeviceInfo = () => {
+export const getDeviceInfo = () => {
   const userAgent = navigator.userAgent;
   let deviceName = 'Unknown Device';
   let deviceType = 'unknown';
@@ -82,12 +82,14 @@ const getDeviceInfo = () => {
     userAgent: userAgent
   };
 };
-// ========== TRADITIONAL AUTHENTICATION ==========
+
+// ========== TRADITIONAL AUTHENTICATION CONTROLLERS ==========
 
 // Traditional Signup
-router.post("/signup", async (req, res) => {
+// In the signup function
+export const signup = async (req, res) => {
   try {
-    const { firstname, lastname, username, password } = req.body;
+    const { firstname, lastname, username, password, email } = req.body;
 
     // Check if user already exists
     const existingUser = await User.findOne({ username });
@@ -97,12 +99,30 @@ router.post("/signup", async (req, res) => {
         message: "Username already exists" 
       });
     }
+    
+    // Check if email already exists
+    const existingEmail = await User.findOne({ email });
+    if (existingEmail) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Email already in use" 
+      });
+    }
+    
+    // Basic email validation
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ 
+        success: false, 
+        message: "Invalid email format" 
+      });
+    }
 
     // Generate unique userId for WebAuthn
     const userId = crypto.randomUUID();
 
     // Hash the password before storing
-    const saltRounds = 12; // Recommended: 10-12 rounds
+    const saltRounds = 12;
     const hashedPassword = await bcrypt.hash(password, saltRounds);
 
     // Create new user
@@ -110,10 +130,12 @@ router.post("/signup", async (req, res) => {
       firstname,
       lastname,
       username,
+      email,  // Store the email
       userId,
-      password: hashedPassword, // ← Store hashed password
+      password: hashedPassword,
       credentials: [],
-      currentChallenge: null
+      currentChallenge: null,
+      knownIPs: []  // Initialize empty known IPs array
     });
 
     await newUser.save();
@@ -126,6 +148,7 @@ router.post("/signup", async (req, res) => {
         username: newUser.username,
         firstname: newUser.firstname,
         lastname: newUser.lastname,
+        email: newUser.email,
         userId: newUser.userId
       }
     });
@@ -137,12 +160,19 @@ router.post("/signup", async (req, res) => {
       message: "Internal server error" 
     });
   }
-});
+};
 
 // Traditional Login
-router.post("/login", async (req, res) => {
+export const login = async (req, res) => {
   try {
-    const { username, password } = req.body;
+      const { username, password, browserLocation } = req.body;
+    
+    // Get client IP address
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    const userAgent = req.headers['user-agent'];
+    
+    // Extract device info from user agent
+    const deviceInfo = extractDeviceInfo(userAgent);
 
     // Find user
     const user = await User.findOne({ username });
@@ -162,6 +192,123 @@ router.post("/login", async (req, res) => {
       });
     }
 
+    // Get location data - prioritize browser location if available
+    let locationInfo = null;
+    let ipLocationInfo = null;
+    
+    // Get IP-based location as fallback
+    try {
+      ipLocationInfo = await getLocationFromIP(ip);
+    } catch (err) {
+      console.error('Failed to get location from IP:', err);
+    }
+    
+    // Use browser location if available, otherwise use IP location
+    locationInfo = browserLocation || ipLocationInfo;
+    
+    console.log('Using location data:', {
+      fromBrowser: !!browserLocation,
+      fromIP: !!ipLocationInfo,
+      final: locationInfo
+    });
+
+    let isSuspiciousLogin = false;
+    let travelAlert = false;
+    let travelDetails = null;
+    
+   
+    
+    const currentTime = new Date();
+    
+    // Check if this is a new IP address
+    const knownIP = user.knownIPs.find(knownIP => knownIP.ip === ip);
+    
+    if (!knownIP) {
+      // This is a new IP address - flag as potentially suspicious
+      isSuspiciousLogin = true;
+      
+      // Check if travel is plausible if we have previous login data
+      if (user.lastLogin?.date && user.lastLogin?.location?.latitude && locationInfo) {
+        const travelPlausibility = isTravelPlausible(
+          user.lastLogin.location,
+          {
+            latitude: locationInfo.latitude || 0,
+            longitude: locationInfo.longitude || 0
+          },
+          new Date(user.lastLogin.date),
+          currentTime
+        );
+        
+        if (!travelPlausibility.plausible) {
+          travelAlert = true;
+          travelDetails = travelPlausibility;
+          console.log(`SECURITY ALERT: Impossible travel detected for user ${username}`);
+          console.log(travelPlausibility);
+        }
+      }
+      
+      // Add this IP to known IPs with location data
+      user.knownIPs.push({
+        ip,
+        firstSeen: currentTime,
+        lastSeen: currentTime,
+        location: locationInfo ? {
+          city: locationInfo.city,
+          region: locationInfo.region,
+          country: locationInfo.country_name,
+          latitude: locationInfo.latitude,
+          longitude: locationInfo.longitude
+        } : null
+      });
+    } else {
+      // Update last seen timestamp for this IP
+      knownIP.lastSeen = currentTime;
+    }
+    
+    // Update last login info with detailed location
+    user.lastLogin = {
+      date: currentTime,
+      ip,
+      userAgent,
+      device: deviceInfo.name,
+      location: locationInfo ? {
+        city: locationInfo.city,
+        region: locationInfo.region,
+        country: locationInfo.country_name,
+        latitude: locationInfo.latitude,
+        longitude: locationInfo.longitude
+      } : null
+    };
+    
+    await user.save();
+    
+    // If suspicious login detected, send email alert
+    if (isSuspiciousLogin || travelAlert) {
+      const location = locationInfo ? 
+        `${locationInfo.city}, ${locationInfo.region}, ${locationInfo.country_name}` : 
+        'Unknown location';
+      
+      // Include travel alert info if applicable
+      const alertInfo = {
+        ip,
+        location,
+        device: deviceInfo.name,
+        browser: deviceInfo.browser,
+        date: currentTime,
+    impossibleTravel: travelAlert ? {
+  previousLocation: `${user.lastLogin.location.city}, ${user.lastLogin.location.country_name}`, // Fixed: was "country"
+  distance: travelDetails?.distance.toFixed(0) + " km",
+  timeElapsed: travelDetails?.timeElapsed.toFixed(1) + " hours",
+  requiredSpeed: travelDetails?.requiredSpeed.toFixed(0) + " km/h"
+} : null
+      };
+      
+      // Send alert email asynchronously (don't await)
+sendSuspiciousLoginAlert(user, alertInfo)
+  .then(result => console.log(`Email alert ${result ? 'sent successfully' : 'failed'} to ${user.email}`))
+  .catch(err => console.error('Error sending security alert:', err));
+    }
+
     res.json({
       success: true,
       message: "Login successful",
@@ -170,6 +317,7 @@ router.post("/login", async (req, res) => {
         username: user.username,
         firstname: user.firstname,
         lastname: user.lastname,
+        email: user.email,
         userId: user.userId,
         hasPasskeys: user.credentials.length > 0
       }
@@ -182,11 +330,56 @@ router.post("/login", async (req, res) => {
       message: "Internal server error" 
     });
   }
-});
-// ========== WEBAUTHN/BIOMETRIC AUTHENTICATION ==========
+};
 
-// Step 1: Generate registration options for biometric setup
-router.post("/webauthn/register/begin", async (req, res) => {
+// Helper function to extract device info from user agent
+const extractDeviceInfo = (userAgent) => {
+  let deviceName = 'Unknown Device';
+  let deviceType = 'unknown';
+  let browser = 'Unknown Browser';
+  
+  if (!userAgent) return { name: deviceName, type: deviceType, browser };
+  
+  // Detect OS
+  if (/iPhone|iPad|iPod/i.test(userAgent)) {
+    deviceName = /iPad/i.test(userAgent) ? 'iPad' : 'iPhone';
+    deviceType = 'mobile';
+  } else if (/Android/i.test(userAgent)) {
+    deviceName = 'Android Device';
+    deviceType = 'mobile';
+  } else if (/Windows/i.test(userAgent)) {
+    deviceName = 'Windows Device';
+    deviceType = 'desktop';
+  } else if (/Mac/i.test(userAgent)) {
+    deviceName = 'Mac Device';
+    deviceType = 'desktop';
+  } else if (/Linux/i.test(userAgent)) {
+    deviceName = 'Linux Device';
+    deviceType = 'desktop';
+  }
+  
+  // Detect browser
+  if (/Chrome/i.test(userAgent) && !/Edg|Edge/i.test(userAgent)) {
+    browser = 'Chrome';
+  } else if (/Firefox/i.test(userAgent)) {
+    browser = 'Firefox';
+  } else if (/Safari/i.test(userAgent) && !/Chrome/i.test(userAgent)) {
+    browser = 'Safari';
+  } else if (/Edg|Edge/i.test(userAgent)) {
+    browser = 'Edge';
+  }
+  
+  return {
+    name: `${deviceName} (${browser})`,
+    type: deviceType,
+    browser
+  };
+};
+
+// ========== WEBAUTHN/BIOMETRIC AUTHENTICATION CONTROLLERS ==========
+
+// Generate registration options for biometric setup
+export const webAuthnRegisterBegin = async (req, res) => {
   try {
     const { username } = req.body;
     const { rpID } = getDomainConfig(req);
@@ -233,9 +426,9 @@ router.post("/webauthn/register/begin", async (req, res) => {
       message: "Failed to generate registration options" 
     });
   }
-});
+};
 
-router.post("/webauthn/register/finish", async (req, res) => {
+export const webAuthnRegisterFinish = async (req, res) => {
   try {
     const { username, credential, deviceInfo } = req.body; // deviceInfo from frontend
     const { rpID, expectedOrigin } = getDomainConfig(req);
@@ -366,8 +559,9 @@ router.post("/webauthn/register/finish", async (req, res) => {
       message: "Registration verification failed" 
     });
   }
-});
-router.post("/webauthn/authenticate/begin", async (req, res) => {
+};
+
+export const webAuthnAuthenticateBegin = async (req, res) => {
   try {
     const { username } = req.body;
     const { rpID } = getDomainConfig(req);
@@ -415,12 +609,21 @@ router.post("/webauthn/authenticate/begin", async (req, res) => {
       message: "Failed to generate authentication options" 
     });
   }
-});
+};
 
-router.post("/webauthn/authenticate/finish", async (req, res) => {
+// In the webAuthnAuthenticateFinish function
+// In the webAuthnAuthenticateFinish function
+export const webAuthnAuthenticateFinish = async (req, res) => {
   try {
-    const { username, credential } = req.body;
+    const { username, credential, browserLocation } = req.body;
     const { rpID, expectedOrigin } = getDomainConfig(req);
+    
+    // Get client IP address
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    const userAgent = req.headers['user-agent'];
+    
+    // Extract device info from user agent
+    const deviceInfo = extractDeviceInfo(userAgent);
 
     const user = await User.findOne({ username });
     if (!user || !user.currentChallenge) {
@@ -454,7 +657,6 @@ router.post("/webauthn/authenticate/finish", async (req, res) => {
       });
     }
 
-    // Rest of your authentication logic...
     console.log('userCredential found:', userCredential);
 
     const verification = await verifyAuthenticationResponse({
@@ -473,8 +675,137 @@ router.post("/webauthn/authenticate/finish", async (req, res) => {
 
     if (verification.verified) {
       userCredential.counter = verification.authenticationInfo.newCounter;
+      userCredential.lastUsed = new Date();
+      
+      // Get location data - prioritize browser location if available
+      let locationInfo = null;
+      let ipLocationInfo = null;
+      
+      // Get IP-based location as fallback
+      try {
+        ipLocationInfo = await getLocationFromIP(ip);
+      } catch (err) {
+        console.error('Failed to get location from IP:', err);
+      }
+      
+      // Use browser location if available, otherwise use IP location
+      locationInfo = browserLocation || ipLocationInfo;
+      
+      console.log('Using location data:', {
+        fromBrowser: !!browserLocation,
+        fromIP: !!ipLocationInfo,
+        final: locationInfo
+      });
+
+      let isSuspiciousLogin = false;
+      let travelAlert = false;
+      let travelDetails = null;
+      
+      const currentTime = new Date();
+      
+      // Check if this is a new IP address
+      const knownIP = user.knownIPs.find(knownIP => knownIP.ip === ip);
+      
+      if (!knownIP) {
+        // This is a new IP address - flag as potentially suspicious
+        isSuspiciousLogin = true;
+        
+        // Check if travel is plausible if we have previous login data
+// In the webAuthnAuthenticateFinish function, uncomment these lines:
+if (user.lastLogin?.date && user.lastLogin?.location?.latitude && locationInfo) {
+  // FORCE SHORT TIME DIFFERENCE FOR TESTING
+  const fakeLastLoginTime = new Date();
+  fakeLastLoginTime.setMinutes(fakeLastLoginTime.getMinutes() - 5); // Only 5 minutes ago
+  
+  const travelPlausibility = isTravelPlausible(
+    user.lastLogin.location,
+    {
+      latitude: locationInfo.latitude || 0,
+      longitude: locationInfo.longitude || 0
+    },
+    fakeLastLoginTime, // Use fake time instead of actual login time
+    currentTime
+  );
+  
+  console.log("Travel plausibility check:", {
+    from: `${user.lastLogin.location.city}, ${user.lastLogin.location.country_name}`,
+    to: `${locationInfo.city}, ${locationInfo.country_name}`,
+    distance: travelPlausibility.distance,
+    timeElapsed: travelPlausibility.timeElapsed,
+    requiredSpeed: travelPlausibility.requiredSpeed,
+    plausible: travelPlausibility.plausible
+  });
+  
+  if (!travelPlausibility.plausible) {
+    travelAlert = true;
+    travelDetails = travelPlausibility;
+    console.log(`SECURITY ALERT: Impossible travel detected for user ${username}`);
+    console.log(travelPlausibility);
+  }
+}
+        
+        // Add this IP to known IPs with location data
+        user.knownIPs.push({
+          ip,
+          firstSeen: currentTime,
+          lastSeen: currentTime,
+          location: locationInfo ? {
+            city: locationInfo.city,
+            region: locationInfo.region,
+            country: locationInfo.country_name,
+            latitude: locationInfo.latitude,
+            longitude: locationInfo.longitude
+          } : null
+        });
+      } else {
+        // Update last seen timestamp for this IP
+        knownIP.lastSeen = currentTime;
+      }
+      
+      // Update last login info with detailed location
+      user.lastLogin = {
+        date: currentTime,
+        ip,
+        userAgent,
+        device: deviceInfo.name,
+        location: locationInfo ? {
+          city: locationInfo.city,
+          region: locationInfo.region,
+          country: locationInfo.country_name,
+          latitude: locationInfo.latitude,
+          longitude: locationInfo.longitude
+        } : null
+      };
+      
       user.currentChallenge = null;
       await user.save();
+      
+      // If suspicious login detected, send email alert
+      if (isSuspiciousLogin || travelAlert) {
+        const location = locationInfo ? 
+          `${locationInfo.city}, ${locationInfo.region}, ${locationInfo.country_name}` : 
+          'Unknown location';
+        
+        // Include travel alert info if applicable
+        const alertInfo = {
+          ip,
+          location,
+          device: deviceInfo.name,
+          browser: deviceInfo.browser,
+          date: currentTime,
+       impossibleTravel: travelAlert ? {
+  previousLocation: `${user.lastLogin.location.city}, ${user.lastLogin.location.country_name}`, // Fixed: was "country"
+  distance: travelDetails?.distance.toFixed(0) + " km",
+  timeElapsed: travelDetails?.timeElapsed.toFixed(1) + " hours",
+  requiredSpeed: travelDetails?.requiredSpeed.toFixed(0) + " km/h"
+} : null
+        };
+        
+        // Send alert email asynchronously (don't await)
+   sendSuspiciousLoginAlert(user, alertInfo)
+  .then(result => console.log(`Email alert ${result ? 'sent successfully' : 'failed'} to ${user.email}`))
+  .catch(err => console.error('Error sending security alert:', err));
+      }
 
       res.json({
         success: true,
@@ -483,7 +814,8 @@ router.post("/webauthn/authenticate/finish", async (req, res) => {
           id: user._id,
           username: user.username,
           firstname: user.firstname,
-          lastname: user.lastname
+          lastname: user.lastname,
+          email: user.email
         }
       });
     } else {
@@ -500,10 +832,10 @@ router.post("/webauthn/authenticate/finish", async (req, res) => {
       message: "Authentication verification failed" 
     });
   }
-});
+};
 
-// Get user info (check if user has biometric setup)
-router.get("/user/:username", async (req, res) => {
+// Get user info
+export const getUserInfo = async (req, res) => {
   try {
     const { username } = req.params;
     
@@ -534,10 +866,10 @@ router.get("/user/:username", async (req, res) => {
       message: "Internal server error" 
     });
   }
-});
+};
 
-// Get user's registered devices with detailed info
-router.get("/user/:username/devices", async (req, res) => {
+// Get user's registered devices
+export const getUserDevices = async (req, res) => {
   try {
     const { username } = req.params;
     
@@ -574,10 +906,10 @@ router.get("/user/:username/devices", async (req, res) => {
       message: "Internal server error" 
     });
   }
-});
+};
 
 // Remove a specific device
-router.delete("/webauthn/device/:username/:credentialId", async (req, res) => {
+export const removeDevice = async (req, res) => {
   try {
     const { username, credentialId } = req.params;
     
@@ -630,6 +962,51 @@ router.delete("/webauthn/device/:username/:credentialId", async (req, res) => {
       message: "Failed to remove device" 
     });
   }
-});
+};
 
-export default router;
+// Add this new testing endpoint
+export const testSuspiciousLogin = async (req, res) => {
+  try {
+    const { username } = req.params;
+    
+    const user = await User.findOne({ username });
+    if (!user) {
+      return res.status(404).json({ 
+        success: false, 
+        message: "User not found" 
+      });
+    }
+    
+    // Create a simulated suspicious login
+    const alertInfo = {
+      ip: '192.168.1.1',
+      location: 'New York, NY, United States',
+      device: 'Unknown Device',
+      browser: 'Chrome',
+      date: new Date(),
+      impossibleTravel: {
+        previousLocation: 'Tokyo, Japan',
+        distance: '10,934 km',
+        timeElapsed: '2.5 hours',
+        requiredSpeed: '4,373 km/h'
+      }
+    };
+    
+    // Send test email alert
+    const emailResult = await sendSuspiciousLoginAlert(user, alertInfo);
+    
+    res.json({
+      success: true,
+      message: `Test suspicious login alert ${emailResult ? 'sent' : 'failed'}`,
+      emailSent: emailResult,
+      sentTo: user.email
+    });
+    
+  } catch (error) {
+    console.error("Test suspicious login error:", error);
+    res.status(500).json({ 
+      success: false, 
+      message: "Failed to send test alert" 
+    });
+  }
+};
