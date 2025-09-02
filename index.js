@@ -6,7 +6,7 @@ import dotenv from "dotenv";
 import cors from "cors";
 import { connectMongo } from "./utils/db.js";
 
-import authRoutes from "./routes/auth.js";
+import authRoutes from "./routes/auth.route.js";
 
 dotenv.config();
 const app = express();

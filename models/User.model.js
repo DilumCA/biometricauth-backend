@@ -5,6 +5,7 @@ const userSchema = new mongoose.Schema({
   lastname: { type: String, required: true },
   username: { type: String, required: true, unique: true },
   userId: { type: String, required: true, unique: true },
+   email: { type: String, required: true, unique: true },
   
   credentials: [{
     credentialID: { type: Buffer, required: true },
@@ -20,7 +21,36 @@ const userSchema = new mongoose.Schema({
   }],
   
   password: { type: String },
-  currentChallenge: String
+  currentChallenge: String,
+
+lastLogin: {
+    date: { type: Date },
+    ip: { type: String },
+    userAgent: { type: String },
+    device: { type: String },
+    // Add these fields:
+    location: {
+      city: { type: String },
+      region: { type: String },
+      country: { type: String },
+      latitude: { type: Number },
+      longitude: { type: Number }
+    }
+  },
+ 
+    knownIPs: [{ 
+    ip: String, 
+    firstSeen: Date, 
+    lastSeen: Date,
+    // Add these fields:
+    location: {
+      city: { type: String },
+      region: { type: String },
+      country: { type: String },
+      latitude: { type: Number },
+      longitude: { type: Number }
+    }
+  }],
   
 }, {
   timestamps: true
