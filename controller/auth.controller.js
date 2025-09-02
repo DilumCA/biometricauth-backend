@@ -221,46 +221,45 @@ export const login = async (req, res) => {
     const currentTime = new Date();
     
     // Check if this is a new IP address
-    const knownIP = user.knownIPs.find(knownIP => knownIP.ip === ip);
-    
-    if (!knownIP) {
-      // This is a new IP address - flag as potentially suspicious
-      isSuspiciousLogin = true;
-      
-      // Check if travel is plausible if we have previous login data
-      if (user.lastLogin?.date && user.lastLogin?.location?.latitude && locationInfo) {
-        const travelPlausibility = isTravelPlausible(
-          user.lastLogin.location,
-          {
-            latitude: locationInfo.latitude || 0,
-            longitude: locationInfo.longitude || 0
-          },
-          new Date(user.lastLogin.date),
-          currentTime
-        );
-        
-        if (!travelPlausibility.plausible) {
-          travelAlert = true;
-          travelDetails = travelPlausibility;
-          console.log(`SECURITY ALERT: Impossible travel detected for user ${username}`);
-          console.log(travelPlausibility);
-        }
-      }
-      
-      // Add this IP to known IPs with location data
-      user.knownIPs.push({
-        ip,
-        firstSeen: currentTime,
-        lastSeen: currentTime,
-        location: locationInfo ? {
-          city: locationInfo.city,
-          region: locationInfo.region,
-          country: locationInfo.country_name,
-          latitude: locationInfo.latitude,
-          longitude: locationInfo.longitude
-        } : null
-      });
-    } else {
+const knownIP = user.knownIPs.find(knownIP => knownIP.ip === ip);
+
+// Always check travel plausibility regardless of known IP
+if (user.lastLogin?.date && user.lastLogin?.location?.latitude && locationInfo) {
+  const travelPlausibility = isTravelPlausible(
+    user.lastLogin.location,
+    {
+      latitude: locationInfo.latitude || 0,
+      longitude: locationInfo.longitude || 0
+    },
+    new Date(user.lastLogin.date),
+    currentTime
+  );
+  
+  if (!travelPlausibility.plausible) {
+    travelAlert = true;
+    travelDetails = travelPlausibility;
+    console.log(`SECURITY ALERT: Impossible travel detected for user ${username}`);
+  }
+}
+
+// Then handle the IP based on whether it's known
+if (!knownIP) {
+  // This is a new IP - flag as suspicious and add to known IPs
+  isSuspiciousLogin = true;
+  
+  user.knownIPs.push({
+    ip,
+    firstSeen: currentTime,
+    lastSeen: currentTime,
+    location: locationInfo ? {
+      city: locationInfo.city,
+      region: locationInfo.region,
+      country_name: locationInfo.country_name,
+      latitude: locationInfo.latitude,
+      longitude: locationInfo.longitude
+    } : null
+  });
+} else {
       // Update last seen timestamp for this IP
       knownIP.lastSeen = currentTime;
     }
