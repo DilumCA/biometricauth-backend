@@ -19,4 +19,5 @@ router.get("/user/:username/devices", authController.getUserDevices);
 router.delete("/webauthn/device/:username/:credentialId", authController.removeDevice);
 // Add this line to your routes
 router.get("/test-suspicious-login/:username", authController.testSuspiciousLogin);
+router.get("/test-email/:username", authController.testEmailService);
 export default router;
