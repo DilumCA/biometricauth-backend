@@ -9,7 +9,7 @@ import crypto from 'crypto';
 import bcrypt from 'bcrypt';
 import { sendSuspiciousLoginAlert } from '../utils/emailService.js';
 import { getLocationFromIP } from '../utils/ipService.js';
-import { isTravelPlausible } from '../utils/securityUtils.js';
+import { isTravelPlausible, calculateDistance } from '../utils/securityUtils.js';
 
 // Constants
 const rpName = 'Biometric Auth App';
