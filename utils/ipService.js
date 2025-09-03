@@ -24,6 +24,19 @@ export const getNextMockIP = () => {
 
 export const getLocationFromIP = async (ip) => {
   try {
+        // Special case for local/internal testing
+    if (ip === '::1' || ip === '127.0.0.1' || 
+        ip.startsWith('10.') || ip.startsWith('172.') || 
+        ip.startsWith('192.168.') || ip.includes('railway.internal')) {
+      console.log('Using mock location for internal IP:', ip);
+      return {
+        city: 'Colombo',
+        region: 'Western Province',
+        country_name: 'Sri Lanka',
+        latitude: 6.9271,
+        longitude: 79.8612
+      };
+    }
     if (USE_MOCK_IP) {
       // For local testing, use a mock IP location
       const mockIP = getNextMockIP();
