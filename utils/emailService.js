@@ -3,8 +3,8 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 // Configure Brevo API client
-const apiKey = process.env.BREVO_API_KEY || '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';
-const EMAIL_USER = process.env.EMAIL_USER || 'dilumandradi00@gmail.com';
+const apiKey = process.env.BREVO_API_KEY;
+const EMAIL_USER = process.env.EMAIL_USER ;
 
 // Set up the API client
 const defaultClient = SibApiV3Sdk.ApiClient.instance;
