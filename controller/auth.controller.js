@@ -1014,3 +1014,61 @@ export const testSuspiciousLogin = async (req, res) => {
     });
   }
 };
+
+
+// Add this to controller/auth.controller.js
+export const testEmailService = async (req, res) => {
+  try {
+    const { username } = req.params;
+    
+    console.log(`🔍 TEST EMAIL REQUEST for user: ${username}`);
+    
+    const user = await User.findOne({ username });
+    if (!user) {
+      console.log(`❌ User not found: ${username}`);
+      return res.status(404).json({ 
+        success: false, 
+        message: "User not found" 
+      });
+    }
+    
+    console.log(`✓ User found: ${username} (${user.email})`);
+    
+    // Create a simple test email
+    const testInfo = {
+      ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
+      location: 'Test Location',
+      device: 'Test Device',
+      browser: 'Test Browser',
+      date: new Date(),
+      impossibleTravel: {
+        previousLocation: 'Test Previous Location',
+        distance: '1000 km',
+        timeElapsed: '1 hour',
+        requiredSpeed: '1000 km/h'
+      }
+    };
+    
+    console.log('⌛ Calling email service...');
+    
+    const emailResult = await sendSuspiciousLoginAlert(user, testInfo);
+    
+    console.log(`📧 Email test result: ${emailResult ? 'SUCCESS' : 'FAILED'}`);
+    
+    return res.json({
+      success: true,
+      message: `Test email ${emailResult ? 'sent' : 'failed'}`,
+      emailSent: emailResult,
+      sentTo: user.email,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error('❌ TEST EMAIL ERROR:', error);
+    return res.status(500).json({
+      success: false,
+      message: "Test email failed",
+      error: error.message
+    });
+  }
+};
