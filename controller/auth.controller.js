@@ -94,7 +94,7 @@ export const getDeviceInfo = () => {
 // In the signup function
 export const signup = async (req, res) => {
   try {
-    const { firstname, lastname, username, password, email } = req.body;
+    const { firstname, lastname, username, password, email, browserLocation } = req.body;
 
     // Check if user already exists
     const existingUser = await User.findOne({ username });
@@ -123,6 +123,24 @@ export const signup = async (req, res) => {
       });
     }
 
+    // Get client IP address for location tracking
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    const currentTime = new Date();
+    
+    // Get location data - prioritize browser location if available
+    let locationInfo = null;
+    let ipLocationInfo = null;
+    
+    // Get IP-based location as fallback
+    try {
+      ipLocationInfo = await getLocationFromIP(ip);
+    } catch (err) {
+      console.error('Failed to get location from IP during signup:', err);
+    }
+    
+    // Use browser location if available, otherwise use IP location
+    locationInfo = browserLocation || ipLocationInfo;
+
     // Generate unique userId for WebAuthn
     const userId = crypto.randomUUID();
 
@@ -130,20 +148,59 @@ export const signup = async (req, res) => {
     const saltRounds = 12;
     const hashedPassword = await bcrypt.hash(password, saltRounds);
 
+    // Create an initial trusted locations array if we have location data
+    const trustedLocations = locationInfo ? [{
+      latitude: locationInfo.latitude,
+      longitude: locationInfo.longitude,
+      city: locationInfo.city,
+      region: locationInfo.region,
+      country_name: locationInfo.country_name,
+      lastUsed: currentTime,
+      visitCount: 1
+    }] : [];
+
+    // Create initial lastTrustedLogin if we have location data
+    const lastTrustedLogin = locationInfo ? {
+      date: currentTime,
+      location: {
+        city: locationInfo.city,
+        region: locationInfo.region,
+        country_name: locationInfo.country_name,
+        latitude: locationInfo.latitude,
+        longitude: locationInfo.longitude
+      }
+    } : null;
+
     // Create new user
     const newUser = new User({
       firstname,
       lastname,
       username,
-      email,  // Store the email
+      email,
       userId,
       password: hashedPassword,
       credentials: [],
       currentChallenge: null,
-      knownIPs: []  // Initialize empty known IPs array
+      knownIPs: locationInfo ? [{
+        ip,
+        firstSeen: currentTime,
+        lastSeen: currentTime,
+        location: {
+          city: locationInfo.city,
+          region: locationInfo.region,
+          country_name: locationInfo.country_name,
+          latitude: locationInfo.latitude,
+          longitude: locationInfo.longitude
+        }
+      }] : [],
+      trustedLocations,
+      lastTrustedLogin
     });
 
     await newUser.save();
+
+    // Include whether we added a trusted location in the response
+    const locationAdded = !!locationInfo;
 
     res.status(201).json({
       success: true,
@@ -154,7 +211,8 @@ export const signup = async (req, res) => {
         firstname: newUser.firstname,
         lastname: newUser.lastname,
         email: newUser.email,
-        userId: newUser.userId
+        userId: newUser.userId,
+        locationCaptured: locationAdded
       }
     });
 
@@ -170,7 +228,7 @@ export const signup = async (req, res) => {
 // Traditional Login
 export const login = async (req, res) => {
   try {
-      const { username, password, browserLocation } = req.body;
+    const { username, password, browserLocation } = req.body;
     
     // Get client IP address
     const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
@@ -220,56 +278,107 @@ export const login = async (req, res) => {
     let isSuspiciousLogin = false;
     let travelAlert = false;
     let travelDetails = null;
-    
-   
-    
     const currentTime = new Date();
     
-    // Check if this is a new IP address
-const knownIP = user.knownIPs.find(knownIP => knownIP.ip === ip);
-
-// Always check travel plausibility regardless of known IP
-if (user.lastLogin?.date && user.lastLogin?.location?.latitude && locationInfo) {
-  const travelPlausibility = isTravelPlausible(
-    user.lastLogin.location,
-    {
-      latitude: locationInfo.latitude || 0,
-      longitude: locationInfo.longitude || 0
-    },
-    new Date(user.lastLogin.date),
-    currentTime
-  );
-  
-  if (!travelPlausibility.plausible) {
-    travelAlert = true;
-    travelDetails = travelPlausibility;
-    console.log(`SECURITY ALERT: Impossible travel detected for user ${username}`);
-  }
-}
-
-// Then handle the IP based on whether it's known
-if (!knownIP) {
-  // This is a new IP - flag as suspicious and add to known IPs
-  isSuspiciousLogin = true;
-  
-  user.knownIPs.push({
-    ip,
-    firstSeen: currentTime,
-    lastSeen: currentTime,
-    location: locationInfo ? {
-      city: locationInfo.city,
-      region: locationInfo.region,
-      country_name: locationInfo.country_name,
-      latitude: locationInfo.latitude,
-      longitude: locationInfo.longitude
-    } : null
-  });
-} else {
+    // Check if this is a known IP address
+    const knownIP = user.knownIPs.find(knownIP => knownIP.ip === ip);
+    if (!knownIP) {
+      // This is a new IP - track it but don't use it as the sole suspicion factor
+      user.knownIPs.push({
+        ip,
+        firstSeen: currentTime,
+        lastSeen: currentTime,
+        location: locationInfo ? {
+          city: locationInfo.city,
+          region: locationInfo.region,
+          country_name: locationInfo.country_name,
+          latitude: locationInfo.latitude,
+          longitude: locationInfo.longitude
+        } : null
+      });
+    } else {
       // Update last seen timestamp for this IP
       knownIP.lastSeen = currentTime;
     }
     
-    // Update last login info with detailed location
+    // TRUSTED LOCATIONS LOGIC
+    // Check if this is a known location
+    const MAX_TRUSTED_DISTANCE = 10; // kilometers
+    let isTrustedLocation = false;
+    let closestTrustedLocation = null;
+
+    // Find if current location is close to any trusted location
+    if (locationInfo && user.trustedLocations && user.trustedLocations.length > 0) {
+      for (const trusted of user.trustedLocations) {
+        const distance = calculateDistance(
+          trusted.latitude, 
+          trusted.longitude,
+          locationInfo.latitude || 0, 
+          locationInfo.longitude || 0
+        );
+        
+        if (distance < MAX_TRUSTED_DISTANCE) {
+          isTrustedLocation = true;
+          closestTrustedLocation = trusted;
+          // Update visit count for this trusted location
+          trusted.visitCount += 1;
+          trusted.lastUsed = currentTime;
+          break;
+        }
+      }
+    }
+
+    // If not a trusted location, check travel plausibility from LAST TRUSTED login
+    if (!isTrustedLocation && user.lastTrustedLogin?.date && locationInfo) {
+      const travelPlausibility = isTravelPlausible(
+        user.lastTrustedLogin.location,
+        {
+          latitude: locationInfo.latitude || 0,
+          longitude: locationInfo.longitude || 0
+        },
+        new Date(user.lastTrustedLogin.date),
+        currentTime
+      );
+      
+      if (!travelPlausibility.plausible) {
+        travelAlert = true;
+        travelDetails = travelPlausibility;
+        console.log(`SECURITY ALERT: Impossible travel detected for user ${username}`);
+      }
+    }
+
+    // Add current location to trusted locations if:
+    // 1. It's already trusted (update count)
+    // 2. OR it's a new location but travel is plausible
+    if (isTrustedLocation) {
+      // Already updated above
+    } else if (!travelAlert && locationInfo) {
+      // This is a new location but the travel looks legitimate
+      // Add it to trusted locations
+      user.trustedLocations.push({
+        latitude: locationInfo.latitude,
+        longitude: locationInfo.longitude,
+        city: locationInfo.city,
+        region: locationInfo.region,
+        country_name: locationInfo.country_name,
+        lastUsed: currentTime,
+        visitCount: 1
+      });
+      
+      // Also update lastTrustedLogin
+      user.lastTrustedLogin = {
+        date: currentTime,
+        location: {
+          city: locationInfo.city,
+          region: locationInfo.region,
+          country_name: locationInfo.country_name,
+          latitude: locationInfo.latitude,
+          longitude: locationInfo.longitude
+        }
+      };
+    }
+
+    // Always update last login (trusted or not)
     user.lastLogin = {
       date: currentTime,
       ip,
@@ -278,7 +387,7 @@ if (!knownIP) {
       location: locationInfo ? {
         city: locationInfo.city,
         region: locationInfo.region,
-        country: locationInfo.country_name,
+        country_name: locationInfo.country_name,
         latitude: locationInfo.latitude,
         longitude: locationInfo.longitude
       } : null
@@ -287,30 +396,35 @@ if (!knownIP) {
     await user.save();
     
     // If suspicious login detected, send email alert
-    if (isSuspiciousLogin || travelAlert) {
+    if (travelAlert) {
       const location = locationInfo ? 
         `${locationInfo.city}, ${locationInfo.region}, ${locationInfo.country_name}` : 
         'Unknown location';
       
-      // Include travel alert info if applicable
+      // Set previous location to last trusted location for clearer alerts
+      const previousLocation = user.lastTrustedLogin?.location ? 
+        `${user.lastTrustedLogin.location.city}, ${user.lastTrustedLogin.location.country_name}` :
+        'Unknown location';
+      
+      // Include travel alert info
       const alertInfo = {
         ip,
         location,
         device: deviceInfo.name,
         browser: deviceInfo.browser,
         date: currentTime,
-    impossibleTravel: travelAlert ? {
-  previousLocation: `${user.lastLogin.location.city}, ${user.lastLogin.location.country_name}`, // Fixed: was "country"
-  distance: travelDetails?.distance.toFixed(0) + " km",
-  timeElapsed: travelDetails?.timeElapsed.toFixed(1) + " hours",
-  requiredSpeed: travelDetails?.requiredSpeed.toFixed(0) + " km/h"
-} : null
+        impossibleTravel: {
+          previousLocation: previousLocation,
+          distance: travelDetails?.distance.toFixed(0) + " km",
+          timeElapsed: travelDetails?.timeElapsed.toFixed(1) + " hours",
+          requiredSpeed: travelDetails?.requiredSpeed.toFixed(0) + " km/h"
+        }
       };
       
       // Send alert email asynchronously (don't await)
-sendSuspiciousLoginAlert(user, alertInfo)
-  .then(result => console.log(`Email alert ${result ? 'sent successfully' : 'failed'} to ${user.email}`))
-  .catch(err => console.error('Error sending security alert:', err));
+      sendSuspiciousLoginAlert(user, alertInfo)
+        .then(result => console.log(`Email alert ${result ? 'sent successfully' : 'failed'} to ${user.email}`))
+        .catch(err => console.error('Error sending security alert:', err));
     }
 
     res.json({
@@ -323,7 +437,8 @@ sendSuspiciousLoginAlert(user, alertInfo)
         lastname: user.lastname,
         email: user.email,
         userId: user.userId,
-        hasPasskeys: user.credentials.length > 0
+        hasPasskeys: user.credentials.length > 0,
+        isTrustedLocation: isTrustedLocation // Add this flag to inform the frontend
       }
     });
 
@@ -617,6 +732,7 @@ export const webAuthnAuthenticateBegin = async (req, res) => {
 
 // In the webAuthnAuthenticateFinish function
 // In the webAuthnAuthenticateFinish function
+// In the webAuthnAuthenticateFinish function
 export const webAuthnAuthenticateFinish = async (req, res) => {
   try {
     const { username, credential, browserLocation } = req.body;
@@ -704,51 +820,12 @@ export const webAuthnAuthenticateFinish = async (req, res) => {
       let isSuspiciousLogin = false;
       let travelAlert = false;
       let travelDetails = null;
-      
       const currentTime = new Date();
       
-      // Check if this is a new IP address
+      // Check if this is a known IP address
       const knownIP = user.knownIPs.find(knownIP => knownIP.ip === ip);
-      
       if (!knownIP) {
-        // This is a new IP address - flag as potentially suspicious
-        isSuspiciousLogin = true;
-        
-        // Check if travel is plausible if we have previous login data
-// In the webAuthnAuthenticateFinish function, uncomment these lines:
-if (user.lastLogin?.date && user.lastLogin?.location?.latitude && locationInfo) {
-  // FORCE SHORT TIME DIFFERENCE FOR TESTING
-  const fakeLastLoginTime = new Date();
-  fakeLastLoginTime.setMinutes(fakeLastLoginTime.getMinutes() - 5); // Only 5 minutes ago
-  
-  const travelPlausibility = isTravelPlausible(
-    user.lastLogin.location,
-    {
-      latitude: locationInfo.latitude || 0,
-      longitude: locationInfo.longitude || 0
-    },
-    fakeLastLoginTime, // Use fake time instead of actual login time
-    currentTime
-  );
-  
-  console.log("Travel plausibility check:", {
-    from: `${user.lastLogin.location.city}, ${user.lastLogin.location.country_name}`,
-    to: `${locationInfo.city}, ${locationInfo.country_name}`,
-    distance: travelPlausibility.distance,
-    timeElapsed: travelPlausibility.timeElapsed,
-    requiredSpeed: travelPlausibility.requiredSpeed,
-    plausible: travelPlausibility.plausible
-  });
-  
-  if (!travelPlausibility.plausible) {
-    travelAlert = true;
-    travelDetails = travelPlausibility;
-    console.log(`SECURITY ALERT: Impossible travel detected for user ${username}`);
-    console.log(travelPlausibility);
-  }
-}
-        
-        // Add this IP to known IPs with location data
+        // This is a new IP - track it but don't use it as the sole suspicion factor
         user.knownIPs.push({
           ip,
           firstSeen: currentTime,
@@ -756,7 +833,7 @@ if (user.lastLogin?.date && user.lastLogin?.location?.latitude && locationInfo) 
           location: locationInfo ? {
             city: locationInfo.city,
             region: locationInfo.region,
-            country: locationInfo.country_name,
+            country_name: locationInfo.country_name,
             latitude: locationInfo.latitude,
             longitude: locationInfo.longitude
           } : null
@@ -766,7 +843,84 @@ if (user.lastLogin?.date && user.lastLogin?.location?.latitude && locationInfo) 
         knownIP.lastSeen = currentTime;
       }
       
-      // Update last login info with detailed location
+      // TRUSTED LOCATIONS LOGIC
+      // Check if this is a known location
+      const MAX_TRUSTED_DISTANCE = 10; // kilometers
+      let isTrustedLocation = false;
+      let closestTrustedLocation = null;
+
+      // Find if current location is close to any trusted location
+      if (locationInfo && user.trustedLocations && user.trustedLocations.length > 0) {
+        for (const trusted of user.trustedLocations) {
+          const distance = calculateDistance(
+            trusted.latitude, 
+            trusted.longitude,
+            locationInfo.latitude || 0, 
+            locationInfo.longitude || 0
+          );
+          
+          if (distance < MAX_TRUSTED_DISTANCE) {
+            isTrustedLocation = true;
+            closestTrustedLocation = trusted;
+            // Update visit count for this trusted location
+            trusted.visitCount += 1;
+            trusted.lastUsed = currentTime;
+            break;
+          }
+        }
+      }
+
+      // If not a trusted location, check travel plausibility from LAST TRUSTED login
+      if (!isTrustedLocation && user.lastTrustedLogin?.date && locationInfo) {
+        const travelPlausibility = isTravelPlausible(
+          user.lastTrustedLogin.location,
+          {
+            latitude: locationInfo.latitude || 0,
+            longitude: locationInfo.longitude || 0
+          },
+          new Date(user.lastTrustedLogin.date),
+          currentTime
+        );
+        
+        if (!travelPlausibility.plausible) {
+          travelAlert = true;
+          travelDetails = travelPlausibility;
+          console.log(`SECURITY ALERT: Impossible travel detected for user ${username}`);
+        }
+      }
+
+      // Add current location to trusted locations if:
+      // 1. It's already trusted (update count)
+      // 2. OR it's a new location but travel is plausible
+      if (isTrustedLocation) {
+        // Already updated above
+      } else if (!travelAlert && locationInfo) {
+        // This is a new location but the travel looks legitimate
+        // Add it to trusted locations
+        user.trustedLocations.push({
+          latitude: locationInfo.latitude,
+          longitude: locationInfo.longitude,
+          city: locationInfo.city,
+          region: locationInfo.region,
+          country_name: locationInfo.country_name,
+          lastUsed: currentTime,
+          visitCount: 1
+        });
+        
+        // Also update lastTrustedLogin
+        user.lastTrustedLogin = {
+          date: currentTime,
+          location: {
+            city: locationInfo.city,
+            region: locationInfo.region,
+            country_name: locationInfo.country_name,
+            latitude: locationInfo.latitude,
+            longitude: locationInfo.longitude
+          }
+        };
+      }
+
+      // Always update last login (trusted or not)
       user.lastLogin = {
         date: currentTime,
         ip,
@@ -775,7 +929,7 @@ if (user.lastLogin?.date && user.lastLogin?.location?.latitude && locationInfo) 
         location: locationInfo ? {
           city: locationInfo.city,
           region: locationInfo.region,
-          country: locationInfo.country_name,
+          country_name: locationInfo.country_name,
           latitude: locationInfo.latitude,
           longitude: locationInfo.longitude
         } : null
@@ -784,31 +938,36 @@ if (user.lastLogin?.date && user.lastLogin?.location?.latitude && locationInfo) 
       user.currentChallenge = null;
       await user.save();
       
-      // If suspicious login detected, send email alert
-      if (isSuspiciousLogin || travelAlert) {
+      // Only send alert for truly suspicious travel, not just new IP
+      if (travelAlert) {
         const location = locationInfo ? 
           `${locationInfo.city}, ${locationInfo.region}, ${locationInfo.country_name}` : 
           'Unknown location';
         
-        // Include travel alert info if applicable
+        // Use trusted location for better context in alerts
+        const previousLocation = user.lastTrustedLogin?.location ? 
+          `${user.lastTrustedLogin.location.city}, ${user.lastTrustedLogin.location.country_name}` :
+          'Unknown location';
+        
+        // Include travel alert info
         const alertInfo = {
           ip,
           location,
           device: deviceInfo.name,
           browser: deviceInfo.browser,
           date: currentTime,
-       impossibleTravel: travelAlert ? {
-  previousLocation: `${user.lastLogin.location.city}, ${user.lastLogin.location.country_name}`, // Fixed: was "country"
-  distance: travelDetails?.distance.toFixed(0) + " km",
-  timeElapsed: travelDetails?.timeElapsed.toFixed(1) + " hours",
-  requiredSpeed: travelDetails?.requiredSpeed.toFixed(0) + " km/h"
-} : null
+          impossibleTravel: {
+            previousLocation: previousLocation,
+            distance: travelDetails?.distance.toFixed(0) + " km",
+            timeElapsed: travelDetails?.timeElapsed.toFixed(1) + " hours",
+            requiredSpeed: travelDetails?.requiredSpeed.toFixed(0) + " km/h"
+          }
         };
         
         // Send alert email asynchronously (don't await)
-   sendSuspiciousLoginAlert(user, alertInfo)
-  .then(result => console.log(`Email alert ${result ? 'sent successfully' : 'failed'} to ${user.email}`))
-  .catch(err => console.error('Error sending security alert:', err));
+        sendSuspiciousLoginAlert(user, alertInfo)
+          .then(result => console.log(`Email alert ${result ? 'sent successfully' : 'failed'} to ${user.email}`))
+          .catch(err => console.error('Error sending security alert:', err));
       }
 
       res.json({
@@ -819,7 +978,8 @@ if (user.lastLogin?.date && user.lastLogin?.location?.latitude && locationInfo) 
           username: user.username,
           firstname: user.firstname,
           lastname: user.lastname,
-          email: user.email
+          email: user.email,
+          isTrustedLocation: isTrustedLocation // Add this flag for frontend awareness
         }
       });
     } else {
