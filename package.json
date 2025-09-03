@@ -8,8 +8,8 @@
     "node": ">=18.0.0"
   },
   "scripts": {
-  "start": "node index.js"
-},
+    "start": "node index.js"
+  },
   "keywords": [
     "biometric",
     "webauthn",
@@ -28,7 +28,8 @@
     "mongoose": "^8.13.2",
     "multer": "^1.4.5-lts.2",
     "multer-storage-cloudinary": "^4.0.0",
-    "nodemailer": "^7.0.6"
+    "nodemailer": "^7.0.6",
+    "sib-api-v3-sdk": "^8.5.0"
   },
   "devDependencies": {
     "nodemon": "^3.1.9"

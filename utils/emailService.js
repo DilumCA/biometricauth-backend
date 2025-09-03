@@ -1,46 +1,60 @@
-import nodemailer from 'nodemailer';
+import SibApiV3Sdk from 'sib-api-v3-sdk';
 import dotenv from 'dotenv';
 dotenv.config();
 
-// Hard-code the email user but use environment variable for password
-const EMAIL_USER = process.env.EMAIL_USER;
-const EMAIL_PASS = process.env.EMAIL_PASSWORD;
+// Configure Brevo API client
+const apiKey = process.env.BREVO_API_KEY || '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';
+const EMAIL_USER = process.env.EMAIL_USER || 'dilumandradi00@gmail.com';
 
-console.log('Email configuration:', {
-  user: EMAIL_USER,
-  passwordLength: EMAIL_PASS ? EMAIL_PASS.length : 0,
-  // Check if .env variables are loading at all
-  nodeEnv: process.env.NODE_ENV
-});
+// Set up the API client
+const defaultClient = SibApiV3Sdk.ApiClient.instance;
+const apiKeyAuth = defaultClient.authentications['api-key'];
+apiKeyAuth.apiKey = apiKey;
 
-// Create the transporter with direct options rather than using service
-const transporter = nodemailer.createTransport({
-  host: 'smtp.gmail.com',
-  port: 465,
-  secure: true,
-  auth: {
-    user: EMAIL_USER,
-    pass: EMAIL_PASS
+// Create API instance
+const apiInstance = new SibApiV3Sdk.TransactionalEmailsApi();
+
+// More detailed startup logging
+console.log('====== EMAIL SERVICE CONFIGURATION ======');
+console.log('- Email Service: Brevo API');
+console.log('- From Email:', EMAIL_USER);
+console.log('- API Key Set:', !!apiKey);
+console.log('- API Key Length:', apiKey ? apiKey.length : 0);
+console.log('- Node Environment:', process.env.NODE_ENV);
+console.log('========================================');
+
+// Test the connection on startup
+const testConnection = async () => {
+  try {
+    console.log('⌛ Testing Brevo API connection...');
+    
+    // There's no direct "verify" method, but we can check if the API key is valid
+    if (apiKey && apiKey.startsWith('xkeysib-')) {
+      console.log('✅ BREVO API CONFIGURED - Ready to send messages');
+    } else {
+      console.log('❌ BREVO API CONFIGURATION ERROR: Invalid API key format');
+    }
+  } catch (error) {
+    console.log('❌ BREVO API CONFIGURATION ERROR:');
+    console.log('- Error Name:', error.name);
+    console.log('- Error Message:', error.message);
   }
-});
+};
 
+// Run the connection test
+testConnection();
 
-// Test the connection
-transporter.verify(function(error, success) {
-  if (error) {
-    console.log('Email server connection error:', error);
-  } else {
-    console.log('Email server connection verified - ready to send messages');
-  }
-});
-
-
+/**
+ * Send a suspicious login alert email to a user
+ * @param {Object} user - The user object with email, firstname, lastname
+ * @param {Object} loginInfo - Information about the suspicious login
+ * @returns {Promise<boolean>} - Whether the email was sent successfully
+ */
 export const sendSuspiciousLoginAlert = async (user, loginInfo) => {
-try {
-  console.log("DEBUG - Email Alert Triggered:");
+  try {
+    console.log("📧 STARTING EMAIL SEND PROCESS");
     console.log("- User email:", user.email);
     console.log("- Alert type:", loginInfo.impossibleTravel ? "Impossible Travel" : "New IP");
-    console.log("- From location:", loginInfo.impossibleTravel?.previousLocation);
     console.log("- To location:", loginInfo.location);
     
     const { email, firstname, lastname } = user;
@@ -48,8 +62,13 @@ try {
     
     let travelWarningHtml = '';
     
-    // Add impossible travel warning if applicable
     if (impossibleTravel) {
+      console.log('- Travel Details:');
+      console.log('  - Previous Location:', impossibleTravel.previousLocation);
+      console.log('  - Distance:', impossibleTravel.distance);
+      console.log('  - Time Elapsed:', impossibleTravel.timeElapsed);
+      console.log('  - Required Speed:', impossibleTravel.requiredSpeed);
+      
       travelWarningHtml = `
         <div style="background-color: #FFEBEE; border-left: 4px solid #F44336; padding: 15px; margin: 20px 0;">
           <h3 style="color: #D32F2F; margin-top: 0;">⚠️ Suspicious Travel Pattern Detected!</h3>
@@ -65,13 +84,10 @@ try {
       `;
     }
     
-    const mailOptions = {
-      from: `"Biometric Auth Security" <${process.env.EMAIL_USER}>`,
-      to: email,
-      subject: impossibleTravel ? 
-        '🚨 URGENT SECURITY ALERT: Suspicious Login Detected' : 
-        'Security Alert: New Login Detected',
-      html: `
+    console.log('⌛ Preparing email content...');
+    
+    const htmlContent = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
         <h2>Hello ${firstname} ${lastname},</h2>
         <p>We detected a new login to your Biometric Auth account.</p>
         ${travelWarningHtml}
@@ -91,14 +107,103 @@ try {
           <li>Contact support if you need assistance securing your account</li>
         </ol>
         <p>Thank you,<br>The Biometric Auth Security Team</p>
-      `
+      </div>
+    `;
+    
+    // Create an email object for Brevo
+    const sendSmtpEmail = new SibApiV3Sdk.SendSmtpEmail();
+    
+    sendSmtpEmail.sender = {
+      name: 'Biometric Auth Security',
+      email: EMAIL_USER
     };
-
-    await transporter.sendMail(mailOptions);
-    console.log(`Security alert email sent to ${email}`);
+    
+    sendSmtpEmail.to = [{
+      email: email,
+      name: `${firstname} ${lastname}`
+    }];
+    
+    sendSmtpEmail.subject = impossibleTravel ? 
+      '🚨 URGENT SECURITY ALERT: Suspicious Login Detected' : 
+      'Security Alert: New Login Detected';
+    
+    sendSmtpEmail.htmlContent = htmlContent;
+    
+    // Log mail options (redact sensitive parts)
+    console.log('✉️ Mail options prepared:');
+    console.log('- From:', `Biometric Auth Security <${EMAIL_USER}>`);
+    console.log('- To:', email);
+    console.log('- Subject:', sendSmtpEmail.subject);
+    console.log('- HTML Length:', htmlContent.length);
+    
+    console.log('⌛ Attempting to send email via Brevo API...');
+    
+    // Send the email with Brevo
+    const result = await apiInstance.sendTransacEmail(sendSmtpEmail);
+    
+    console.log('✅ EMAIL SENT SUCCESSFULLY:');
+    console.log('- Message ID:', result.messageId);
+    
     return true;
   } catch (error) {
-    console.error('Failed to send security alert email:', error);
+    console.error('❌ EMAIL SEND FAILURE:');
+    console.error('- Error Name:', error.name);
+    console.error('- Error Message:', error.message);
+    
+    // Detailed API error information if available
+    if (error.response) {
+      console.error('- Status Code:', error.response.statusCode);
+      console.error('- Response Body:', JSON.stringify(error.response.body, null, 2));
+    }
+    
+    return false;
+  }
+};
+
+/**
+ * Send a test email to verify email configuration
+ * @param {string} toEmail - Email address to send test to
+ * @returns {Promise<boolean>} - Whether the email was sent successfully
+ */
+export const sendTestEmail = async (toEmail) => {
+  try {
+    console.log(`⌛ Sending test email to ${toEmail}...`);
+    
+    // Create an email object for Brevo
+    const sendSmtpEmail = new SibApiV3Sdk.SendSmtpEmail();
+    
+    sendSmtpEmail.sender = {
+      name: 'Biometric Auth Test',
+      email: EMAIL_USER
+    };
+    
+    sendSmtpEmail.to = [{
+      email: toEmail
+    }];
+    
+    sendSmtpEmail.subject = 'Email Configuration Test';
+    
+    sendSmtpEmail.htmlContent = `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <h2>Email Configuration Test</h2>
+        <p>This is a test email to verify that your email configuration is working correctly.</p>
+        <p>If you received this email, your email service is configured correctly!</p>
+        <p>Sent at: ${new Date().toLocaleString()}</p>
+      </div>
+    `;
+    
+    const result = await apiInstance.sendTransacEmail(sendSmtpEmail);
+    console.log('✅ TEST EMAIL SENT SUCCESSFULLY:', result.messageId);
+    return true;
+  } catch (error) {
+    console.error('❌ TEST EMAIL FAILED:', error);
+    
+    // Detailed API error information if available
+    if (error.response) {
+      console.error('- Status Code:', error.response.statusCode);
+      console.error('- Response Body:', JSON.stringify(error.response.body, null, 2));
+    }
+    
     return false;
   }
 };
