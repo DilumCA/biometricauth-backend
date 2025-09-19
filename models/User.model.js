@@ -51,6 +51,25 @@ lastLogin: {
       longitude: { type: Number }
     }
   }],
+   trustedLocations: [{
+    latitude: Number,
+    longitude: Number,
+    city: String,
+    region: String,
+    country_name: String,
+    lastUsed: Date,
+    visitCount: { type: Number, default: 1 }
+  }],
+  lastTrustedLogin: {
+    date: Date,
+    location: {
+      city: String,
+      region: String, 
+      country_name: String,
+      latitude: Number,
+      longitude: Number
+    }
+  }
   
 }, {
   timestamps: true
