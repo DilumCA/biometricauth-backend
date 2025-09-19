@@ -51,6 +51,19 @@ lastLogin: {
       longitude: { type: Number }
     }
   }],
+  //meta mask authentication
+  wallets: [{
+  address: { type: String, lowercase: true },
+  chain: { type: String, default: 'ethereum' },
+  firstUsed: { type: Date, default: Date.now },
+  lastUsed: { type: Date, default: Date.now },
+  nonce: { type: String }
+}],
+// Track current authentication challenge for wallet auth
+walletChallenge: {
+  nonce: String,
+  expires: Date
+}
   
 }, {
   timestamps: true
