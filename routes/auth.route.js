@@ -1,5 +1,6 @@
 import express from "express";
 import * as authController from "../controller/auth.controller.js";
+import * as blockchainController from "../controller/blockchain.controller.js";
 
 const router = express.Router();
 
@@ -20,4 +21,10 @@ router.delete("/webauthn/device/:username/:credentialId", authController.removeD
 // Add this line to your routes
 router.get("/test-suspicious-login/:username", authController.testSuspiciousLogin);
 router.get("/test-email/:username", authController.testEmailService);
+
+// ========== BLOCKCHAIN/METAMASK AUTHENTICATION ==========
+router.post("/wallet/authenticate/begin", blockchainController.walletAuthBegin);
+router.post("/wallet/authenticate/finish", blockchainController.walletAuthFinish);
+router.get("/user/:username/wallets", blockchainController.getUserWallets);
+router.delete("/wallet/:username/:address", blockchainController.removeWallet);
 export default router;
