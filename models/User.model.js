@@ -69,7 +69,7 @@ lastLogin: {
       latitude: Number,
       longitude: Number
     }
-  }
+  },
   //meta mask authentication
   wallets: [{
   address: { type: String, lowercase: true },
